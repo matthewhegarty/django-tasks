@@ -44,7 +44,7 @@ def _map_priority(value: int) -> int:
     return mapped_value
 
 
-@dataclass
+#@dataclass
 class Task(BaseTask[P, T]):
     celery_task: CeleryTaskProxy = None
     """Celery proxy to the task in the current celery app task registry."""
