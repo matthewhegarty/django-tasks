@@ -2,12 +2,14 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
+import django
 from django.core.exceptions import SuspiciousOperation
 from django.db import models
 from django.db.models import F, Q
 from django.db.models.constraints import CheckConstraint
 from django.utils import timezone
 from django.utils.module_loading import import_string
+from django.utils.translation import gettext_lazy as _
 from typing_extensions import ParamSpec
 
 from django_tasks.task import (
@@ -59,6 +61,12 @@ class DBTaskResultQuerySet(models.QuerySet):
     def failed(self) -> "DBTaskResultQuerySet":
         return self.filter(status=ResultStatus.FAILED)
 
+    def running(self) -> "DBTaskResultQuerySet":
+        return self.filter(status=ResultStatus.RUNNING)
+
+    def finished(self) -> "DBTaskResultQuerySet":
+        return self.failed() | self.complete()
+
     @retry()
     def get_locked(self) -> Optional["DBTaskResult"]:
         """
@@ -71,40 +79,51 @@ class DBTaskResult(GenericBase[P, T], models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     status = models.CharField(
+        _("status"),
         choices=ResultStatus.choices,
         default=ResultStatus.NEW,
         max_length=max(len(value) for value in ResultStatus.values),
     )
 
-    enqueued_at = models.DateTimeField(auto_now_add=True)
-    started_at = models.DateTimeField(null=True)
-    finished_at = models.DateTimeField(null=True)
+    enqueued_at = models.DateTimeField(_("enqueued at"), auto_now_add=True)
+    started_at = models.DateTimeField(_("started at"), null=True)
+    finished_at = models.DateTimeField(_("finished at"), null=True)
 
-    args_kwargs = models.JSONField()
+    args_kwargs = models.JSONField(_("args kwargs"))
 
-    priority = models.IntegerField(default=DEFAULT_PRIORITY)
+    priority = models.IntegerField(_("priority"), default=DEFAULT_PRIORITY)
 
-    task_path = models.TextField()
+    task_path = models.TextField(_("task path"))
 
-    queue_name = models.TextField(default=DEFAULT_QUEUE_NAME)
-    backend_name = models.TextField()
+    queue_name = models.TextField(_("queue name"), default=DEFAULT_QUEUE_NAME)
+    backend_name = models.TextField(_("backend name"))
 
-    run_after = models.DateTimeField(null=True)
+    run_after = models.DateTimeField(_("run after"), null=True)
 
-    result = models.JSONField(default=None, null=True)
+    return_value = models.JSONField(_("return value"), default=None, null=True)
+    exception_data = models.JSONField(_("exception data"), default=None, null=True)
 
     objects = DBTaskResultQuerySet.as_manager()
 
     class Meta:
         ordering = [F("priority").desc(), F("run_after").desc(nulls_last=True)]
-        verbose_name = "Task Result"
-        verbose_name_plural = "Task Results"
-        constraints = [
-            CheckConstraint(
-                check=Q(priority__range=(MIN_PRIORITY, MAX_PRIORITY)),
-                name="priority_range",
-            )
-        ]
+        verbose_name = _("Task Result")
+        verbose_name_plural = _("Task Results")
+
+        if django.VERSION >= (5, 1):
+            constraints = [
+                CheckConstraint(
+                    condition=Q(priority__range=(MIN_PRIORITY, MAX_PRIORITY)),
+                    name="priority_range",
+                )
+            ]
+        else:
+            constraints = [
+                CheckConstraint(
+                    check=Q(priority__range=(MIN_PRIORITY, MAX_PRIORITY)),
+                    name="priority_range",
+                )
+            ]
 
     @property
     def task(self) -> Task[P, T]:
@@ -139,7 +158,8 @@ class DBTaskResult(GenericBase[P, T], models.Model):
             backend=self.backend_name,
         )
 
-        result._result = self.result
+        object.__setattr__(result, "_return_value", self.return_value)
+        object.__setattr__(result, "_exception_data", self.exception_data)
 
         return result
 
@@ -153,19 +173,25 @@ class DBTaskResult(GenericBase[P, T], models.Model):
         self.save(update_fields=["status", "started_at"])
 
     @retry()
-    def set_result(self, result: Any) -> None:
+    def set_complete(self, return_value: Any) -> None:
         self.status = ResultStatus.COMPLETE
         self.finished_at = timezone.now()
-        self.result = result
-        self.save(update_fields=["status", "result", "finished_at"])
+        self.return_value = return_value
+        self.exception_data = None
+        self.save(
+            update_fields=["status", "return_value", "finished_at", "exception_data"]
+        )
 
     @retry()
     def set_failed(self, exc: BaseException) -> None:
         self.status = ResultStatus.FAILED
         self.finished_at = timezone.now()
         try:
-            self.result = exception_to_dict(exc)
+            self.exception_data = exception_to_dict(exc)
         except Exception:
             logger.exception("Task id=%s unable to save exception", self.id)
-            self.result = None
-        self.save(update_fields=["status", "finished_at", "result"])
+            self.exception_data = None
+        self.return_value = None
+        self.save(
+            update_fields=["status", "finished_at", "exception_data", "return_value"]
+        )

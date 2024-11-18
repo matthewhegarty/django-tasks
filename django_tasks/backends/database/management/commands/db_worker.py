@@ -1,12 +1,16 @@
 import logging
+import math
 import random
 import signal
+import sys
 import time
 from argparse import ArgumentParser, ArgumentTypeError
 from types import FrameType
 from typing import List, Optional
 
+from django.core.exceptions import SuspiciousOperation
 from django.core.management.base import BaseCommand
+from django.db import connections
 from django.db.utils import OperationalError
 
 from django_tasks import DEFAULT_TASK_BACKEND_ALIAS, tasks
@@ -14,35 +18,50 @@ from django_tasks.backends.database.backend import DatabaseBackend
 from django_tasks.backends.database.models import DBTaskResult
 from django_tasks.backends.database.utils import exclusive_transaction
 from django_tasks.exceptions import InvalidTaskBackendError
-from django_tasks.task import DEFAULT_QUEUE_NAME, ResultStatus
+from django_tasks.signals import task_finished
+from django_tasks.task import DEFAULT_QUEUE_NAME
 
+package_logger = logging.getLogger("django_tasks")
 logger = logging.getLogger("django_tasks.backends.database.db_worker")
 
 
 class Worker:
     def __init__(
-        self, *, queue_names: List[str], interval: float, batch: bool, backend_name: str
+        self,
+        *,
+        queue_names: List[str],
+        interval: float,
+        batch: bool,
+        backend_name: str,
+        startup_delay: bool,
     ):
         self.queue_names = queue_names
         self.process_all_queues = "*" in queue_names
         self.interval = interval
         self.batch = batch
         self.backend_name = backend_name
+        self.startup_delay = startup_delay
 
         self.running = True
         self.running_task = False
 
     def shutdown(self, signum: int, frame: Optional[FrameType]) -> None:
-        logger.warning(
-            "Received %s - shutting down gracefully.", signal.strsignal(signum)
-        )
+        if not self.running:
+            logger.warning(
+                "Received %s - terminating current task.", signal.strsignal(signum)
+            )
+            sys.exit(1)
 
+        logger.warning(
+            "Received %s - shutting down gracefully... (press Ctrl+C again to force)",
+            signal.strsignal(signum),
+        )
         self.running = False
 
         if not self.running_task:
             # If we're not currently running a task, exit immediately.
             # This is useful if we're currently in a `sleep`.
-            exit(0)
+            sys.exit(0)
 
     def configure_signals(self) -> None:
         signal.signal(signal.SIGINT, self.shutdown)
@@ -55,7 +74,7 @@ class Worker:
 
         logger.info("Starting worker for queues=%s", ",".join(self.queue_names))
 
-        if self.interval:
+        if self.startup_delay and self.interval:
             # Add a random small delay before starting the loop to avoid a thundering herd
             time.sleep(random.random())
 
@@ -75,7 +94,7 @@ class Worker:
                     except OperationalError as e:
                         # Ignore locked databases and keep trying.
                         # It should unlock eventually.
-                        if "database is locked" in e.args[0]:
+                        if "is locked" in e.args[0]:
                             task_result = None
                         else:
                             raise
@@ -90,12 +109,18 @@ class Worker:
             finally:
                 self.running_task = False
 
+                for conn in connections.all(initialized_only=True):
+                    conn.close()
+
             if self.batch and task_result is None:
                 # If we're running in "batch" mode, terminate the loop (and thus the worker)
                 return None
 
-            # Wait before checking for another task
-            time.sleep(self.interval)
+            # If ctrl-c has just interrupted a task, self.running was cleared,
+            # and we should not sleep, but rather exit immediately.
+            if self.running and not task_result:
+                # Wait before checking for another task
+                time.sleep(self.interval)
 
     def run_task(self, db_task_result: DBTaskResult) -> None:
         """
@@ -109,32 +134,28 @@ class Worker:
                 "Task id=%s path=%s state=%s",
                 db_task_result.id,
                 db_task_result.task_path,
-                ResultStatus.RUNNING,
+                task_result.status,
             )
             return_value = task.call(*task_result.args, **task_result.kwargs)
 
             # Setting the return and success value inside the error handling,
             # So errors setting it (eg JSON encode) can still be recorded
-            db_task_result.set_result(return_value)
-            logger.info(
-                "Task id=%s path=%s state=%s",
-                db_task_result.id,
-                db_task_result.task_path,
-                ResultStatus.COMPLETE,
+            db_task_result.set_complete(return_value)
+            task_finished.send(
+                sender=type(task.get_backend()), task_result=db_task_result.task_result
             )
         except BaseException as e:
-            # Use `.exception` to integrate with error monitoring tools (eg Sentry)
-            logger.exception(
-                "Task id=%s path=%s state=%s",
-                db_task_result.id,
-                db_task_result.task_path,
-                ResultStatus.FAILED,
-            )
             db_task_result.set_failed(e)
-
-            # If the user tried to terminate, let them
-            if isinstance(e, KeyboardInterrupt):
-                raise
+            try:
+                sender = type(db_task_result.task.get_backend())
+                task_result = db_task_result.task_result
+            except (ModuleNotFoundError, SuspiciousOperation):
+                logger.exception("Task id=%s failed unexpectedly", db_task_result.id)
+            else:
+                task_finished.send(
+                    sender=sender,
+                    task_result=task_result,
+                )
 
 
 def valid_backend_name(val: str) -> str:
@@ -148,10 +169,9 @@ def valid_backend_name(val: str) -> str:
 
 
 def valid_interval(val: str) -> float:
-    # Cast to an int first to catch invalid values like 'inf'
-    int(val)
-
     num = float(val)
+    if not math.isfinite(num):
+        raise ArgumentTypeError("Must be a finite floating point value")
     if num < 0:
         raise ArgumentTypeError("Must be greater than zero")
     return num
@@ -173,7 +193,7 @@ class Command(BaseCommand):
             nargs="?",
             default=1,
             type=valid_interval,
-            help="The interval (in seconds) at which to check for tasks to process (default: %(default)r)",
+            help="The interval (in seconds) to wait, when there are no tasks in the queue, before checking for tasks again (default: %(default)r)",
         )
         parser.add_argument(
             "--batch",
@@ -188,21 +208,27 @@ class Command(BaseCommand):
             dest="backend_name",
             help="The backend to operate on (default: %(default)r)",
         )
+        parser.add_argument(
+            "--no-startup-delay",
+            action="store_false",
+            dest="startup_delay",
+            help="Don't add a small delay at startup.",
+        )
 
     def configure_logging(self, verbosity: int) -> None:
         if verbosity == 0:
-            logger.setLevel(logging.CRITICAL)
+            package_logger.setLevel(logging.CRITICAL)
         elif verbosity == 1:
-            logger.setLevel(logging.WARNING)
+            package_logger.setLevel(logging.WARNING)
         elif verbosity == 2:
-            logger.setLevel(logging.INFO)
+            package_logger.setLevel(logging.INFO)
         else:
-            logger.setLevel(logging.DEBUG)
+            package_logger.setLevel(logging.DEBUG)
 
         # If no handler is configured, the logs won't show,
         # regardless of the set level.
-        if not logger.hasHandlers():
-            logger.addHandler(logging.StreamHandler(self.stdout))
+        if not package_logger.hasHandlers():
+            package_logger.addHandler(logging.StreamHandler(self.stdout))
 
     def handle(
         self,
@@ -212,6 +238,7 @@ class Command(BaseCommand):
         interval: float,
         batch: bool,
         backend_name: str,
+        startup_delay: bool,
         **options: dict,
     ) -> None:
         self.configure_logging(verbosity)
@@ -221,6 +248,7 @@ class Command(BaseCommand):
             interval=interval,
             batch=batch,
             backend_name=backend_name,
+            startup_delay=startup_delay,
         )
 
         worker.start()

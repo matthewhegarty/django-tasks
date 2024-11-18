@@ -4,7 +4,7 @@ import django_stubs_ext
 django_stubs_ext.monkeypatch()
 
 import importlib.metadata
-from typing import Mapping, Optional, cast
+from typing import Optional
 
 from django.utils.connection import BaseConnectionHandler, ConnectionProxy
 from django.utils.module_loading import import_string
@@ -16,6 +16,7 @@ from .task import (
     DEFAULT_TASK_BACKEND_ALIAS,
     ResultStatus,
     Task,
+    TaskResult,
     task,
 )
 
@@ -23,11 +24,13 @@ __version__ = importlib.metadata.version(__name__)
 
 __all__ = [
     "tasks",
+    "default_task_backend",
     "DEFAULT_TASK_BACKEND_ALIAS",
     "DEFAULT_QUEUE_NAME",
     "task",
     "ResultStatus",
     "Task",
+    "TaskResult",
 ]
 
 
@@ -48,10 +51,7 @@ class TasksHandler(BaseConnectionHandler[BaseTaskBackend]):
             }
 
     def create_connection(self, alias: str) -> BaseTaskBackend:
-        params = self.settings[alias].copy()
-
-        # Added back to allow a backend to self-identify
-        params["ALIAS"] = alias
+        params = self.settings[alias]
 
         backend = params["BACKEND"]
 
@@ -62,9 +62,11 @@ class TasksHandler(BaseConnectionHandler[BaseTaskBackend]):
                 f"Could not find backend '{backend}': {e}"
             ) from e
 
-        return backend_cls(params)  # type:ignore[no-any-return]
+        return backend_cls(alias=alias, params=params)  # type:ignore[no-any-return]
 
 
 tasks = TasksHandler()
 
-default_task_backend = ConnectionProxy(cast(Mapping, tasks), DEFAULT_TASK_BACKEND_ALIAS)
+default_task_backend: BaseTaskBackend = ConnectionProxy(  # type:ignore[assignment]
+    tasks, DEFAULT_TASK_BACKEND_ALIAS
+)

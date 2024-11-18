@@ -6,9 +6,9 @@
 ![PyPI - Status](https://img.shields.io/pypi/status/django-tasks.svg)
 ![PyPI - License](https://img.shields.io/pypi/l/django-tasks.svg)
 
-A reference implementation and backport of background workers and tasks in Django, as defined in [DEP 0014](https://github.com/django/deps/blob/main/accepted/0014-background-workers.rst).
+An implementation and backport of background workers and tasks in Django, as defined in [DEP 0014](https://github.com/django/deps/blob/main/accepted/0014-background-workers.rst).
 
-**Warning**: This package is under active development, and breaking changes may be released at any time. Be sure to pin to specific versions (even patch versions) if you're using this package in a production environment.
+**Warning**: This package is under active development, and breaking changes may be released at any time. Be sure to pin to specific versions if you're using this package in a production environment.
 
 ## Installation
 
@@ -67,8 +67,9 @@ The task decorator accepts a few arguments to customize the task:
 - `priority`: The priority of the task (between -100 and 100. Larger numbers are higher priority. 0 by default)
 - `queue_name`: Whether to run the task on a specific queue
 - `backend`: Name of the backend for this task to use (as defined in `TASKS`)
+- `enqueue_on_commit`: Whether the task is enqueued when the current transaction commits successfully, or enqueued immediately. By default, this is handled by the backend (see below). `enqueue_on_commit` may not be modified with `.using`.
 
-These attributes can also be modified at run-time with `.using`:
+These attributes (besides `enqueue_on_commit`) can also be modified at run-time with `.using`:
 
 ```python
 modified_task = calculate_meaning_of_life.using(priority=10)
@@ -87,6 +88,23 @@ result = calculate_meaning_of_life.enqueue()
 The returned `TaskResult` can be interrogated to query the current state of the running task, as well as its return value.
 
 If the task takes arguments, these can be passed as-is to `enqueue`.
+
+#### Transactions
+
+By default, tasks are enqueued after the current transaction (if there is one) commits successfully (using Django's `transaction.on_commit` method), rather than enqueueing immediately.
+
+This can be configured using the `ENQUEUE_ON_COMMIT` setting. `True` and `False` force the behaviour.
+
+```python
+TASKS = {
+    "default": {
+        "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+        "ENQUEUE_ON_COMMIT": False
+    }
+}
+```
+
+This can also be configured per-task by passing `enqueue_on_commit` to the `task` decorator.
 
 ### Queue names
 
@@ -139,6 +157,10 @@ Finally, you can run the `db_worker` command to run tasks as they're created. Ch
 ./manage.py db_worker
 ```
 
+### Pruning old tasks
+
+After a while, tasks may start to build up in your database. This can be managed using the `prune_db_task_results` management command, which deletes completed and failed tasks according to the given retention policy. Check the `--help` for the available options.
+
 ### Retrieving task result
 
 When enqueueing a task, you get a `TaskResult`, however it may be useful to retrieve said result from somewhere else (another request, another task etc). This can be done with `get_result` (or `aget_result`):
@@ -160,11 +182,11 @@ default_task_backend.get_result(result_id)
 
 ### Return values
 
-If your task returns something, it can be retrieved from the `.result` attribute on a `TaskResult`. Accessing this property on an unfinished task (ie not `COMPLETE` or `FAILED`) will raise a `ValueError`.
+If your task returns something, it can be retrieved from the `.return_value` attribute on a `TaskResult`. Accessing this property on an unfinished task (ie not `COMPLETE` or `FAILED`) will raise a `ValueError`.
 
 ```python
 assert result.status == ResultStatus.COMPLETE
-assert result.result == 42
+assert result.return_value == 42
 ```
 
 If a result has been updated in the background, you can call `refresh` on it to update its values. Results obtained using `get_result` will always be up-to-date.
@@ -177,10 +199,10 @@ assert result.status == ResultStatus.COMPLETE
 
 #### Exceptions
 
-If a task raised an exception, its `.result` will be the exception raised:
+If a task raised an exception, its `.exception` will be the exception raised:
 
 ```python
-assert isinstance(result.result, ValueError)
+assert isinstance(result.exception, ValueError)
 ```
 
 As part of the serialization process for exceptions, some information is lost. The traceback information is reduced to a string that you can print to help debugging:
@@ -208,6 +230,15 @@ assert default_task_backend.supports_get_result
 ```
 
 This is particularly useful in combination with Django's [system check framework](https://docs.djangoproject.com/en/stable/topics/checks/).
+
+### Signals
+
+A few [Signals](https://docs.djangoproject.com/en/stable/topics/signals/) are provided to more easily respond to certain task events.
+
+Whilst signals are available, they may not be the most maintainable approach.
+
+- `django_tasks.signals.task_enqueued`: Called when a task is enqueued. The sender is the backend class. Also called with the enqueued `task_result`.
+- `django_tasks.signals.task_finished`: Called when a task finishes (`COMPLETE` or `FAILED`). The sender is the backend class. Also called with the finished `task_result`.
 
 ## Contributing
 

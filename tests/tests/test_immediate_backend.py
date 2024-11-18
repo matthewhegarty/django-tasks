@@ -1,17 +1,24 @@
 import json
+from typing import cast
 
-from django.test import SimpleTestCase, override_settings
+from django.db import transaction
+from django.test import SimpleTestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from django_tasks import ResultStatus, default_task_backend, tasks
+from django_tasks import ResultStatus, Task, default_task_backend, tasks
 from django_tasks.backends.immediate import ImmediateBackend
 from django_tasks.exceptions import InvalidTaskError
 from tests import tasks as test_tasks
 
 
 @override_settings(
-    TASKS={"default": {"BACKEND": "django_tasks.backends.immediate.ImmediateBackend"}}
+    TASKS={
+        "default": {
+            "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+            "ENQUEUE_ON_COMMIT": False,
+        }
+    }
 )
 class ImmediateBackendTestCase(SimpleTestCase):
     def test_using_correct_backend(self) -> None:
@@ -21,14 +28,14 @@ class ImmediateBackendTestCase(SimpleTestCase):
     def test_enqueue_task(self) -> None:
         for task in [test_tasks.noop_task, test_tasks.noop_task_async]:
             with self.subTest(task):
-                result = default_task_backend.enqueue(task, (1,), {"two": 3})
+                result = cast(Task, task).enqueue(1, two=3)
 
                 self.assertEqual(result.status, ResultStatus.COMPLETE)
                 self.assertIsNotNone(result.started_at)
                 self.assertIsNotNone(result.finished_at)
-                self.assertGreaterEqual(result.started_at, result.enqueued_at)
-                self.assertGreaterEqual(result.finished_at, result.started_at)
-                self.assertIsNone(result.result)
+                self.assertGreaterEqual(result.started_at, result.enqueued_at)  # type:ignore[arg-type, misc]
+                self.assertGreaterEqual(result.finished_at, result.started_at)  # type:ignore[arg-type, misc]
+                self.assertIsNone(result.return_value)
                 self.assertEqual(result.task, task)
                 self.assertEqual(result.args, [1])
                 self.assertEqual(result.kwargs, {"two": 3})
@@ -36,15 +43,14 @@ class ImmediateBackendTestCase(SimpleTestCase):
     async def test_enqueue_task_async(self) -> None:
         for task in [test_tasks.noop_task, test_tasks.noop_task_async]:
             with self.subTest(task):
-                result = await default_task_backend.aenqueue(task, (), {})
+                result = await cast(Task, task).aenqueue()
 
                 self.assertEqual(result.status, ResultStatus.COMPLETE)
                 self.assertIsNotNone(result.started_at)
                 self.assertIsNotNone(result.finished_at)
-                self.assertGreaterEqual(result.started_at, result.enqueued_at)
-                self.assertGreaterEqual(result.finished_at, result.started_at)
-                self.assertIsNone(result.result)
-                self.assertIsNone(result.get_result())
+                self.assertGreaterEqual(result.started_at, result.enqueued_at)  # type:ignore[arg-type, misc]
+                self.assertGreaterEqual(result.finished_at, result.started_at)  # type:ignore[arg-type, misc]
+                self.assertIsNone(result.return_value)
                 self.assertEqual(result.task, task)
                 self.assertEqual(result.args, [])
                 self.assertEqual(result.kwargs, {})
@@ -64,9 +70,9 @@ class ImmediateBackendTestCase(SimpleTestCase):
         ]
         for task, exception, message in test_data:
             with self.subTest(task), self.assertLogs(
-                "django_tasks.backends.immediate", level="ERROR"
+                "django_tasks", level="ERROR"
             ) as captured_logs:
-                result = default_task_backend.enqueue(task, [], {})
+                result = task.enqueue()
 
                 # assert logging
                 self.assertEqual(len(captured_logs.output), 1)
@@ -76,46 +82,40 @@ class ImmediateBackendTestCase(SimpleTestCase):
                 self.assertEqual(result.status, ResultStatus.FAILED)
                 self.assertIsNotNone(result.started_at)
                 self.assertIsNotNone(result.finished_at)
-                self.assertGreaterEqual(result.started_at, result.enqueued_at)
-                self.assertGreaterEqual(result.finished_at, result.started_at)
-                self.assertIsInstance(result.result, exception)
+                self.assertGreaterEqual(result.started_at, result.enqueued_at)  # type:ignore[arg-type, misc]
+                self.assertGreaterEqual(result.finished_at, result.started_at)  # type:ignore[arg-type, misc]
+                self.assertIsInstance(result.exception, exception)
                 self.assertTrue(
-                    result.traceback.endswith(f"{exception.__name__}: {message}\n")
+                    result.traceback
+                    and result.traceback.endswith(f"{exception.__name__}: {message}\n")
                 )
-                self.assertIsNone(result.get_result())
                 self.assertEqual(result.task, task)
                 self.assertEqual(result.args, [])
                 self.assertEqual(result.kwargs, {})
 
     def test_throws_keyboard_interrupt(self) -> None:
         with self.assertRaises(KeyboardInterrupt):
-            with self.assertLogs(
-                "django_tasks.backends.immediate", level="ERROR"
-            ) as captured_logs:
+            with self.assertLogs("django_tasks", level="ERROR") as captured_logs:
                 default_task_backend.enqueue(
                     test_tasks.failing_task_keyboard_interrupt, [], {}
                 )
 
         # assert logging
-        self.assertEqual(len(captured_logs.output), 1)
-        self.assertIn(
-            "This task failed due to KeyboardInterrupt", captured_logs.output[0]
-        )
+        self.assertEqual(len(captured_logs.output), 0)
 
     def test_complex_exception(self) -> None:
-        with self.assertLogs("django_tasks.backends.immediate", level="ERROR"):
-            result = default_task_backend.enqueue(test_tasks.complex_exception, [], {})
+        with self.assertLogs("django_tasks", level="ERROR"):
+            result = test_tasks.complex_exception.enqueue()
 
         self.assertEqual(result.status, ResultStatus.FAILED)
         self.assertIsNotNone(result.started_at)
         self.assertIsNotNone(result.finished_at)
-        self.assertGreaterEqual(result.started_at, result.enqueued_at)
-        self.assertGreaterEqual(result.finished_at, result.started_at)
+        self.assertGreaterEqual(result.started_at, result.enqueued_at)  # type:ignore[arg-type,misc]
+        self.assertGreaterEqual(result.finished_at, result.started_at)  # type:ignore[arg-type,misc]
 
-        self.assertIsNone(result.result)
+        self.assertIsNone(result._return_value)
         self.assertIsNone(result.traceback)
 
-        self.assertIsNone(result.get_result())
         self.assertEqual(result.task, test_tasks.complex_exception)
         self.assertEqual(result.args, [])
         self.assertEqual(result.kwargs, {})
@@ -126,7 +126,7 @@ class ImmediateBackendTestCase(SimpleTestCase):
         )
 
         self.assertEqual(result.status, ResultStatus.COMPLETE)
-        self.assertEqual(result.result, 42)
+        self.assertEqual(result.return_value, 42)
 
     async def test_result_async(self) -> None:
         result = await default_task_backend.aenqueue(
@@ -134,7 +134,7 @@ class ImmediateBackendTestCase(SimpleTestCase):
         )
 
         self.assertEqual(result.status, ResultStatus.COMPLETE)
-        self.assertEqual(result.result, 42)
+        self.assertEqual(result.return_value, 42)
 
     async def test_cannot_get_result(self) -> None:
         with self.assertRaisesMessage(
@@ -147,10 +147,10 @@ class ImmediateBackendTestCase(SimpleTestCase):
             NotImplementedError,
             "This backend does not support retrieving or refreshing results.",
         ):
-            await default_task_backend.get_result(123)
+            await default_task_backend.aget_result(123)  # type:ignore[arg-type]
 
     async def test_cannot_refresh_result(self) -> None:
-        result = default_task_backend.enqueue(
+        result = await default_task_backend.aenqueue(
             test_tasks.calculate_meaning_of_life, (), {}
         )
 
@@ -201,3 +201,111 @@ class ImmediateBackendTestCase(SimpleTestCase):
             "This backend does not support retrieving or refreshing results.",
         ):
             response = self.client.get(reverse("result", args=[result_id]))
+
+    def test_enqueue_on_commit(self) -> None:
+        self.assertTrue(
+            default_task_backend._get_enqueue_on_commit_for_task(
+                test_tasks.enqueue_on_commit_task
+            )
+        )
+
+    def test_enqueue_logs(self) -> None:
+        with self.assertLogs("django_tasks", level="DEBUG") as captured_logs:
+            result = test_tasks.noop_task.enqueue()
+
+        self.assertIn("enqueued", captured_logs.output[0])
+        self.assertIn(result.id, captured_logs.output[0])
+
+
+class ImmediateBackendTransactionTestCase(TransactionTestCase):
+    @override_settings(
+        TASKS={
+            "default": {
+                "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+                "ENQUEUE_ON_COMMIT": True,
+            }
+        }
+    )
+    def test_wait_until_transaction_commit(self) -> None:
+        self.assertTrue(default_task_backend.enqueue_on_commit)
+        self.assertTrue(
+            default_task_backend._get_enqueue_on_commit_for_task(test_tasks.noop_task)
+        )
+
+        with transaction.atomic():
+            result = test_tasks.noop_task.enqueue()
+
+            self.assertIsNone(result.enqueued_at)
+            self.assertEqual(result.status, ResultStatus.NEW)
+
+        self.assertEqual(result.status, ResultStatus.COMPLETE)
+        self.assertIsNotNone(result.enqueued_at)
+
+    @override_settings(
+        TASKS={
+            "default": {
+                "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+                "ENQUEUE_ON_COMMIT": False,
+            }
+        }
+    )
+    def test_doesnt_wait_until_transaction_commit(self) -> None:
+        self.assertFalse(default_task_backend.enqueue_on_commit)
+        self.assertFalse(
+            default_task_backend._get_enqueue_on_commit_for_task(test_tasks.noop_task)
+        )
+
+        with transaction.atomic():
+            result = test_tasks.noop_task.enqueue()
+
+            self.assertIsNotNone(result.enqueued_at)
+
+            self.assertEqual(result.status, ResultStatus.COMPLETE)
+
+        self.assertEqual(result.status, ResultStatus.COMPLETE)
+
+    @override_settings(
+        TASKS={
+            "default": {
+                "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+            }
+        }
+    )
+    def test_wait_until_transaction_by_default(self) -> None:
+        self.assertTrue(default_task_backend.enqueue_on_commit)
+        self.assertTrue(
+            default_task_backend._get_enqueue_on_commit_for_task(test_tasks.noop_task)
+        )
+
+        with transaction.atomic():
+            result = test_tasks.noop_task.enqueue()
+
+            self.assertIsNone(result.enqueued_at)
+            self.assertEqual(result.status, ResultStatus.NEW)
+
+        self.assertEqual(result.status, ResultStatus.COMPLETE)
+
+    @override_settings(
+        TASKS={
+            "default": {
+                "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+                "ENQUEUE_ON_COMMIT": False,
+            }
+        }
+    )
+    def test_task_specific_enqueue_on_commit(self) -> None:
+        self.assertFalse(default_task_backend.enqueue_on_commit)
+        self.assertTrue(test_tasks.enqueue_on_commit_task.enqueue_on_commit)
+        self.assertTrue(
+            default_task_backend._get_enqueue_on_commit_for_task(
+                test_tasks.enqueue_on_commit_task
+            )
+        )
+
+        with transaction.atomic():
+            result = test_tasks.enqueue_on_commit_task.enqueue()
+
+            self.assertIsNone(result.enqueued_at)
+            self.assertEqual(result.status, ResultStatus.NEW)
+
+        self.assertEqual(result.status, ResultStatus.COMPLETE)

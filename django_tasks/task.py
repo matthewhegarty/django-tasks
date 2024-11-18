@@ -1,5 +1,4 @@
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from inspect import iscoroutinefunction
 from typing import (
@@ -18,6 +17,7 @@ from typing import (
 from asgiref.sync import async_to_sync, sync_to_async
 from django.db.models.enums import TextChoices
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 from typing_extensions import ParamSpec, Self
 
 from .exceptions import ResultDoesNotExist
@@ -32,19 +32,28 @@ MIN_PRIORITY = -100
 MAX_PRIORITY = 100
 DEFAULT_PRIORITY = 0
 
+TASK_REFRESH_ATTRS = {
+    "_exception_data",
+    "_return_value",
+    "finished_at",
+    "started_at",
+    "status",
+    "enqueued_at",
+}
+
 
 class ResultStatus(TextChoices):
-    NEW = ("NEW", "New")
-    RUNNING = ("RUNNING", "Running")
-    FAILED = ("FAILED", "Failed")
-    COMPLETE = ("COMPLETE", "Complete")
+    NEW = ("NEW", _("New"))
+    RUNNING = ("RUNNING", _("Running"))
+    FAILED = ("FAILED", _("Failed"))
+    COMPLETE = ("COMPLETE", _("Complete"))
 
 
 T = TypeVar("T")
 P = ParamSpec("P")
 
 
-@dataclass
+@dataclass(frozen=True)
 class Task(Generic[P, T]):
     priority: int
     """The priority of the task"""
@@ -56,10 +65,16 @@ class Task(Generic[P, T]):
     """The name of the backend the task will run on"""
 
     queue_name: str = DEFAULT_QUEUE_NAME
-    """The name of the queue the task will run on """
+    """The name of the queue the task will run on"""
 
     run_after: Optional[datetime] = None
     """The earliest this task will run"""
+
+    enqueue_on_commit: Optional[bool] = None
+    """
+    Whether the task will be enqueued when the current transaction commits,
+    immediately, or whatever the backend decides
+    """
 
     def __post_init__(self) -> None:
         self.get_backend().validate_task(self)
@@ -83,22 +98,21 @@ class Task(Generic[P, T]):
         Create a new task with modified defaults
         """
 
-        task = deepcopy(self)
+        changes: Dict[str, Any] = {}
+
         if priority is not None:
-            task.priority = priority
+            changes["priority"] = priority
         if queue_name is not None:
-            task.queue_name = queue_name
+            changes["queue_name"] = queue_name
         if run_after is not None:
             if isinstance(run_after, timedelta):
-                task.run_after = timezone.now() + run_after
+                changes["run_after"] = timezone.now() + run_after
             else:
-                task.run_after = run_after
+                changes["run_after"] = run_after
         if backend is not None:
-            task.backend = backend
+            changes["backend"] = backend
 
-        task.get_backend().validate_task(task)
-
-        return task
+        return replace(self, **changes)
 
     def enqueue(self, *args: P.args, **kwargs: P.kwargs) -> "TaskResult[T]":
         """
@@ -170,6 +184,7 @@ def task(
     priority: int = DEFAULT_PRIORITY,
     queue_name: str = DEFAULT_QUEUE_NAME,
     backend: str = DEFAULT_TASK_BACKEND_ALIAS,
+    enqueue_on_commit: Optional[bool] = None,
 ) -> Callable[[Callable[P, T]], Task[P, T]]: ...
 
 
@@ -180,6 +195,7 @@ def task(
     priority: int = DEFAULT_PRIORITY,
     queue_name: str = DEFAULT_QUEUE_NAME,
     backend: str = DEFAULT_TASK_BACKEND_ALIAS,
+    enqueue_on_commit: Optional[bool] = None,
 ) -> Union[Task[P, T], Callable[[Callable[P, T]], Task[P, T]]]:
     """
     A decorator used to create a task.
@@ -188,7 +204,11 @@ def task(
 
     def wrapper(f: Callable[P, T]) -> Task[P, T]:
         return tasks[backend].task_class(
-            priority=priority, func=f, queue_name=queue_name, backend=backend
+            priority=priority,
+            func=f,
+            queue_name=queue_name,
+            backend=backend,
+            enqueue_on_commit=enqueue_on_commit,
         )
 
     if function:
@@ -197,7 +217,7 @@ def task(
     return wrapper
 
 
-@dataclass
+@dataclass(frozen=True)
 class TaskResult(Generic[T]):
     task: Task
     """The task for which this is a result"""
@@ -208,7 +228,7 @@ class TaskResult(Generic[T]):
     status: ResultStatus
     """The status of the running task"""
 
-    enqueued_at: datetime
+    enqueued_at: Optional[datetime]
     """The time this task was enqueued"""
 
     started_at: Optional[datetime]
@@ -226,38 +246,43 @@ class TaskResult(Generic[T]):
     backend: str
     """The name of the backend the task will run on"""
 
-    _result: Optional[Union[T, SerializedExceptionDict]] = field(
-        init=False, default=None
-    )
+    _return_value: Optional[T] = field(init=False, default=None)
+    _exception_data: Optional[SerializedExceptionDict] = field(init=False, default=None)
 
     @property
-    def result(self) -> Optional[Union[T, BaseException]]:
-        if self.status == ResultStatus.COMPLETE:
-            return cast(T, self._result)
-        elif self.status == ResultStatus.FAILED:
-            return (
-                exception_from_dict(cast(SerializedExceptionDict, self._result))
-                if self._result is not None
-                else None
-            )
-
-        raise ValueError("Task has not finished yet")
+    def exception(self) -> Optional[BaseException]:
+        return (
+            exception_from_dict(cast(SerializedExceptionDict, self._exception_data))
+            if self.status == ResultStatus.FAILED and self._exception_data is not None
+            else None
+        )
 
     @property
     def traceback(self) -> Optional[str]:
         """
         Return the string representation of the traceback of the task if it failed
         """
-        if self.status == ResultStatus.FAILED and self._result is not None:
-            return cast(SerializedExceptionDict, self._result)["exc_traceback"]
+        return (
+            cast(SerializedExceptionDict, self._exception_data)["exc_traceback"]
+            if self.status == ResultStatus.FAILED and self._exception_data is not None
+            else None
+        )
 
-        return None
+    @property
+    def return_value(self) -> Optional[T]:
+        """
+        Get the return value of the task.
 
-    def get_result(self) -> Optional[T]:
+        If the task didn't complete successfully, an exception is raised.
+        This is to distinguish against the task returning None.
         """
-        A convenience method to get the result, or None if it's not ready yet or has failed.
-        """
-        return cast(T, self.result) if self.status == ResultStatus.COMPLETE else None
+        if self.status == ResultStatus.FAILED:
+            raise ValueError("Task failed")
+
+        elif self.status != ResultStatus.COMPLETE:
+            raise ValueError("Task has not finished yet")
+
+        return cast(T, self._return_value)
 
     def refresh(self) -> None:
         """
@@ -265,11 +290,8 @@ class TaskResult(Generic[T]):
         """
         refreshed_task = self.task.get_backend().get_result(self.id)
 
-        # status, started_at, finished_at and result are the only refreshable attributes
-        self.status = refreshed_task.status
-        self.started_at = refreshed_task.started_at
-        self.finished_at = refreshed_task.finished_at
-        self._result = refreshed_task._result
+        for attr in TASK_REFRESH_ATTRS:
+            object.__setattr__(self, attr, getattr(refreshed_task, attr))
 
     async def arefresh(self) -> None:
         """
@@ -277,8 +299,5 @@ class TaskResult(Generic[T]):
         """
         refreshed_task = await self.task.get_backend().aget_result(self.id)
 
-        # status, started_at, finished_at and result are the only refreshable attributes
-        self.status = refreshed_task.status
-        self.started_at = refreshed_task.started_at
-        self.finished_at = refreshed_task.finished_at
-        self._result = refreshed_task._result
+        for attr in TASK_REFRESH_ATTRS:
+            object.__setattr__(self, attr, getattr(refreshed_task, attr))

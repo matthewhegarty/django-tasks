@@ -29,6 +29,7 @@ from tests import tasks as test_tasks
         "default": {
             "BACKEND": "django_tasks.backends.dummy.DummyBackend",
             "QUEUES": ["default", "queue_1"],
+            "ENQUEUE_ON_COMMIT": False,
         },
         "immediate": {"BACKEND": "django_tasks.backends.immediate.ImmediateBackend"},
         "missing": {"BACKEND": "does.not.exist"},
@@ -36,7 +37,7 @@ from tests import tasks as test_tasks
 )
 class TaskTestCase(SimpleTestCase):
     def setUp(self) -> None:
-        default_task_backend.clear()
+        default_task_backend.clear()  # type:ignore[attr-defined]
 
     def test_using_correct_backend(self) -> None:
         self.assertEqual(default_task_backend, tasks["default"])
@@ -51,21 +52,21 @@ class TaskTestCase(SimpleTestCase):
         result = test_tasks.noop_task.enqueue()
 
         self.assertEqual(result.status, ResultStatus.NEW)
-        self.assertIs(result.task, test_tasks.noop_task)
+        self.assertEqual(result.task, test_tasks.noop_task)
         self.assertEqual(result.args, [])
         self.assertEqual(result.kwargs, {})
 
-        self.assertEqual(default_task_backend.results, [result])
+        self.assertEqual(default_task_backend.results, [result])  # type:ignore[attr-defined]
 
     async def test_enqueue_task_async(self) -> None:
         result = await test_tasks.noop_task.aenqueue()
 
         self.assertEqual(result.status, ResultStatus.NEW)
-        self.assertIs(result.task, test_tasks.noop_task)
+        self.assertEqual(result.task, test_tasks.noop_task)
         self.assertEqual(result.args, [])
         self.assertEqual(result.kwargs, {})
 
-        self.assertEqual(default_task_backend.results, [result])
+        self.assertEqual(default_task_backend.results, [result])  # type:ignore[attr-defined]
 
     def test_using_priority(self) -> None:
         self.assertEqual(test_tasks.noop_task.priority, 0)
@@ -113,8 +114,20 @@ class TaskTestCase(SimpleTestCase):
         self.assertEqual(new_task, test_tasks.noop_task)
         self.assertIsNot(new_task, test_tasks.noop_task)
 
+    def test_chained_using(self) -> None:
+        now = timezone.now()
+
+        run_after_task = test_tasks.noop_task.using(run_after=now)
+        self.assertEqual(run_after_task.run_after, now)
+
+        priority_task = run_after_task.using(priority=10)
+        self.assertEqual(priority_task.priority, 10)
+        self.assertEqual(priority_task.run_after, now)
+
+        self.assertEqual(run_after_task.priority, 0)
+
     async def test_refresh_result(self) -> None:
-        result = test_tasks.noop_task.enqueue()
+        result = await test_tasks.noop_task.aenqueue()
 
         original_result = dataclasses.asdict(result)
 
@@ -188,12 +201,13 @@ class TaskTestCase(SimpleTestCase):
         with self.assertRaises(ResultDoesNotExist):
             await test_tasks.noop_task.aget_result("123")
 
-    async def test_get_incorrect_result(self) -> None:
+    def test_get_incorrect_result(self) -> None:
         result = default_task_backend.enqueue(test_tasks.noop_task_async, (), {})
-
         with self.assertRaises(ResultDoesNotExist):
             test_tasks.noop_task.get_result(result.id)
 
+    async def test_get_incorrect_result_async(self) -> None:
+        result = await default_task_backend.aenqueue(test_tasks.noop_task_async, (), {})
         with self.assertRaises(ResultDoesNotExist):
             await test_tasks.noop_task.aget_result(result.id)
 
@@ -202,7 +216,7 @@ class TaskTestCase(SimpleTestCase):
             with self.subTest(invalid_function):
                 with self.assertRaisesMessage(
                     InvalidTaskError,
-                    "Task function must be a globally importable function",
+                    "Task function must be defined at a module level",
                 ):
                     task()(invalid_function)  # type:ignore[arg-type]
 

@@ -15,12 +15,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-        django-version: ["4.2", "5.0"]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        django-version: ["4.2", "5.0", "5.1"]
         exclude:
           - django-version: "5.0"
             python-version: "3.8"
           - django-version: "5.0"
+            python-version: "3.9"
+          - django-version: "5.1"
+            python-version: "3.8"
+          - django-version: "5.1"
             python-version: "3.9"
           - os: windows-latest  # JSON1 is only built-in on 3.9+
             python-version: 3.8
@@ -45,6 +49,8 @@ jobs:
         run: just lint
       - name: Run tests
         run: just test
+      - name: Run fast tests
+        run: just test-fast
 
   test-postgres:
     runs-on: ubuntu-latest
@@ -60,13 +66,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        django-version: ["4.2", "5.0"]
+        django-version: ["4.2", "5.0", "5.1"]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.12
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -95,13 +101,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        django-version: ["4.2", "5.0"]
+        django-version: ["4.2", "5.0", "5.1"]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python 3.12
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -132,7 +138,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version: "3.13"
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip build

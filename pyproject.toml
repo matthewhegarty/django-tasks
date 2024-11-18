@@ -6,15 +6,15 @@ requires = [
 
 [project]
 name = "django-tasks"
-description = "A reference implementation and backport of background workers and tasks in Django"
+description = "An implementation and backport of background workers and tasks in Django"
 authors = [
     {name = "Jake Howard"},
 ]
-version = "0.3.0"
+version = "0.5.0"
 readme = "README.md"
 license = {file = "LICENSE"}
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -22,12 +22,14 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "Environment :: Web Environment",
     "Framework :: Django",
     "Framework :: Django",
     "Framework :: Django :: 4.2",
     "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Natural Language :: English",
@@ -64,6 +66,10 @@ postgres = [
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "N", "B", "A", "C4", "T20", "DJ"]
 ignore = ["E501", "DJ008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/db_worker_test_settings.py" = ["F403", "F405"]
+"tests/settings_fast.py" = ["F403", "F405"]
 
 [tool.mypy]
 plugins = ["mypy_django_plugin.main"]

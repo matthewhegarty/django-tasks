@@ -3,19 +3,23 @@ from inspect import iscoroutinefunction
 from typing import Any, Iterable, TypeVar
 
 from asgiref.sync import sync_to_async
-from django.core.checks.messages import CheckMessage
+from django.core.checks import messages
+from django.db import connections
 from django.utils import timezone
 from typing_extensions import ParamSpec
 
 from django_tasks.exceptions import InvalidTaskError
 from django_tasks.task import MAX_PRIORITY, MIN_PRIORITY, Task, TaskResult
-from django_tasks.utils import is_global_function
+from django_tasks.utils import is_module_level_function
 
 T = TypeVar("T")
 P = ParamSpec("P")
 
 
 class BaseTaskBackend(metaclass=ABCMeta):
+    alias: str
+    enqueue_on_commit: bool
+
     task_class = Task
 
     supports_defer = False
@@ -27,20 +31,34 @@ class BaseTaskBackend(metaclass=ABCMeta):
     supports_get_result = False
     """Can results be retrieved after the fact (from **any** thread / process)"""
 
-    def __init__(self, options: dict) -> None:
+    def __init__(self, alias: str, params: dict) -> None:
         from django_tasks import DEFAULT_QUEUE_NAME
 
-        self.alias = options["ALIAS"]
-        self.queues = set(options.get("QUEUES", [DEFAULT_QUEUE_NAME]))
+        self.alias = alias
+        self.queues = set(params.get("QUEUES", [DEFAULT_QUEUE_NAME]))
+        self.enqueue_on_commit = bool(params.get("ENQUEUE_ON_COMMIT", True))
+
+    def _get_enqueue_on_commit_for_task(self, task: Task) -> bool:
+        """
+        Determine the correct `enqueue_on_commit` setting to use for a given task.
+
+        If the task defines it, use that, otherwise, fall back to the backend.
+        """
+        # If this project doesn't use a database, there's nothing to commit to
+        if not connections.settings:
+            return False
+
+        if task.enqueue_on_commit is not None:
+            return task.enqueue_on_commit
+
+        return self.enqueue_on_commit
 
     def validate_task(self, task: Task) -> None:
         """
         Determine whether the provided task is one which can be executed by the backend.
         """
-        if not is_global_function(task.func):
-            raise InvalidTaskError(
-                "Task function must be a globally importable function"
-            )
+        if not is_module_level_function(task.func):
+            raise InvalidTaskError("Task function must be defined at a module level")
 
         if not self.supports_async_task and iscoroutinefunction(task.func):
             raise InvalidTaskError("Backend does not support async tasks")
@@ -101,8 +119,10 @@ class BaseTaskBackend(metaclass=ABCMeta):
             result_id=result_id
         )
 
-    def check(self, **kwargs: Any) -> Iterable[CheckMessage]:
-        raise NotImplementedError(
-            "subclasses may provide a check() method to verify that task "
-            "backend is configured correctly."
-        )
+    def check(self, **kwargs: Any) -> Iterable[messages.CheckMessage]:
+        if self.enqueue_on_commit and not connections.settings:
+            yield messages.CheckMessage(
+                messages.ERROR,
+                "`ENQUEUE_ON_COMMIT` cannot be used when no databases are configured",
+                hint="Set `ENQUEUE_ON_COMMIT` to False",
+            )
