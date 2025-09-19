@@ -1,13 +1,21 @@
 import json
 from typing import cast
+from unittest import mock
 
 from django.db import transaction
-from django.test import SimpleTestCase, TransactionTestCase, override_settings
+from django.db.utils import ConnectionHandler
+from django.test import (
+    SimpleTestCase,
+    TransactionTestCase,
+    override_settings,
+    skipIfDBFeature,
+)
 from django.urls import reverse
 
-from django_tasks import ResultStatus, Task, default_task_backend, tasks
+from django_tasks import ResultStatus, default_task_backend, tasks
 from django_tasks.backends.dummy import DummyBackend
-from django_tasks.exceptions import ResultDoesNotExist
+from django_tasks.base import Task
+from django_tasks.exceptions import InvalidTaskError, ResultDoesNotExist
 from tests import tasks as test_tasks
 
 
@@ -15,6 +23,7 @@ from tests import tasks as test_tasks
     TASKS={
         "default": {
             "BACKEND": "django_tasks.backends.dummy.DummyBackend",
+            "QUEUES": [],
             "ENQUEUE_ON_COMMIT": False,
         }
     }
@@ -26,20 +35,25 @@ class DummyBackendTestCase(SimpleTestCase):
     def test_using_correct_backend(self) -> None:
         self.assertEqual(default_task_backend, tasks["default"])
         self.assertIsInstance(tasks["default"], DummyBackend)
+        self.assertEqual(default_task_backend.alias, "default")
+        self.assertEqual(default_task_backend.options, {})
 
     def test_enqueue_task(self) -> None:
         for task in [test_tasks.noop_task, test_tasks.noop_task_async]:
             with self.subTest(task):
                 result = cast(Task, task).enqueue(1, two=3)
 
-                self.assertEqual(result.status, ResultStatus.NEW)
+                self.assertEqual(result.status, ResultStatus.READY)
+                self.assertFalse(result.is_finished)
                 self.assertIsNone(result.started_at)
+                self.assertIsNone(result.last_attempted_at)
                 self.assertIsNone(result.finished_at)
                 with self.assertRaisesMessage(ValueError, "Task has not finished yet"):
                     result.return_value  # noqa:B018
                 self.assertEqual(result.task, task)
                 self.assertEqual(result.args, [1])
                 self.assertEqual(result.kwargs, {"two": 3})
+                self.assertEqual(result.attempts, 0)
 
                 self.assertIn(result, default_task_backend.results)  # type:ignore[attr-defined]
 
@@ -48,14 +62,17 @@ class DummyBackendTestCase(SimpleTestCase):
             with self.subTest(task):
                 result = await cast(Task, task).aenqueue()
 
-                self.assertEqual(result.status, ResultStatus.NEW)
+                self.assertEqual(result.status, ResultStatus.READY)
+                self.assertFalse(result.is_finished)
                 self.assertIsNone(result.started_at)
+                self.assertIsNone(result.last_attempted_at)
                 self.assertIsNone(result.finished_at)
                 with self.assertRaisesMessage(ValueError, "Task has not finished yet"):
                     result.return_value  # noqa:B018
                 self.assertEqual(result.task, task)
                 self.assertEqual(result.args, [])
                 self.assertEqual(result.kwargs, {})
+                self.assertEqual(result.attempts, 0)
 
                 self.assertIn(result, default_task_backend.results)  # type:ignore[attr-defined]
 
@@ -79,11 +96,11 @@ class DummyBackendTestCase(SimpleTestCase):
         )
 
         enqueued_result = default_task_backend.results[0]  # type:ignore[attr-defined]
-        object.__setattr__(enqueued_result, "status", ResultStatus.COMPLETE)
+        object.__setattr__(enqueued_result, "status", ResultStatus.SUCCEEDED)
 
-        self.assertEqual(result.status, ResultStatus.NEW)
+        self.assertEqual(result.status, ResultStatus.READY)
         result.refresh()
-        self.assertEqual(result.status, ResultStatus.COMPLETE)
+        self.assertEqual(result.status, ResultStatus.SUCCEEDED)
 
     async def test_refresh_result_async(self) -> None:
         result = await default_task_backend.aenqueue(
@@ -91,11 +108,11 @@ class DummyBackendTestCase(SimpleTestCase):
         )
 
         enqueued_result = default_task_backend.results[0]  # type:ignore[attr-defined]
-        object.__setattr__(enqueued_result, "status", ResultStatus.COMPLETE)
+        object.__setattr__(enqueued_result, "status", ResultStatus.SUCCEEDED)
 
-        self.assertEqual(result.status, ResultStatus.NEW)
+        self.assertEqual(result.status, ResultStatus.READY)
         await result.arefresh()
-        self.assertEqual(result.status, ResultStatus.COMPLETE)
+        self.assertEqual(result.status, ResultStatus.SUCCEEDED)
 
     async def test_get_missing_result(self) -> None:
         with self.assertRaises(ResultDoesNotExist):
@@ -116,10 +133,10 @@ class DummyBackendTestCase(SimpleTestCase):
                 data = json.loads(response.content)
 
                 self.assertEqual(data["result"], None)
-                self.assertEqual(data["status"], ResultStatus.NEW)
+                self.assertEqual(data["status"], ResultStatus.READY)
 
                 result = default_task_backend.get_result(data["result_id"])
-                self.assertEqual(result.status, ResultStatus.NEW)
+                self.assertEqual(result.status, ResultStatus.READY)
 
     def test_get_result_from_different_request(self) -> None:
         response = self.client.get(reverse("meaning-of-life"))
@@ -133,7 +150,7 @@ class DummyBackendTestCase(SimpleTestCase):
 
         self.assertEqual(
             json.loads(response.content),
-            {"result_id": result_id, "result": None, "status": ResultStatus.NEW},
+            {"result_id": result_id, "result": None, "status": ResultStatus.READY},
         )
 
     def test_enqueue_on_commit(self) -> None:
@@ -150,6 +167,89 @@ class DummyBackendTestCase(SimpleTestCase):
         self.assertEqual(len(captured_logs.output), 1)
         self.assertIn("enqueued", captured_logs.output[0])
         self.assertIn(result.id, captured_logs.output[0])
+
+    def test_errors(self) -> None:
+        result = test_tasks.noop_task.enqueue()
+
+        self.assertEqual(result.errors, [])
+
+    def test_validate_disallowed_async_task(self) -> None:
+        with mock.patch.multiple(default_task_backend, supports_async_task=False):
+            with self.assertRaisesMessage(
+                InvalidTaskError, "Backend does not support async tasks"
+            ):
+                default_task_backend.validate_task(test_tasks.noop_task_async)
+
+    def test_check(self) -> None:
+        errors = list(default_task_backend.check())
+
+        self.assertEqual(len(errors), 0, errors)
+
+    @override_settings(
+        TASKS={
+            "default": {
+                "BACKEND": "django_tasks.backends.dummy.DummyBackend",
+                "ENQUEUE_ON_COMMIT": True,
+            }
+        }
+    )
+    @mock.patch("django_tasks.backends.base.connections", ConnectionHandler({}))
+    def test_enqueue_on_commit_with_no_databases(self) -> None:
+        self.assertIn(
+            "tasks.E001", {error.id for error in default_task_backend.check()}
+        )
+
+    def test_takes_context(self) -> None:
+        result = test_tasks.get_task_id.enqueue()
+        self.assertEqual(result.status, ResultStatus.READY)
+
+    def test_clear(self) -> None:
+        result = test_tasks.noop_task.enqueue()
+
+        default_task_backend.get_result(result.id)
+
+        default_task_backend.clear()  # type:ignore[attr-defined]
+
+        with self.assertRaisesMessage(ResultDoesNotExist, result.id):
+            default_task_backend.get_result(result.id)
+
+    def test_validate_on_enqueue(self) -> None:
+        task_with_custom_queue_name = test_tasks.noop_task.using(
+            queue_name="unknown_queue"
+        )
+
+        with override_settings(
+            TASKS={
+                "default": {
+                    "BACKEND": "django_tasks.backends.dummy.DummyBackend",
+                    "QUEUES": ["queue-1"],
+                    "ENQUEUE_ON_COMMIT": False,
+                }
+            }
+        ):
+            with self.assertRaisesMessage(
+                InvalidTaskError, "Queue 'unknown_queue' is not valid for backend"
+            ):
+                task_with_custom_queue_name.enqueue()
+
+    async def test_validate_on_aenqueue(self) -> None:
+        task_with_custom_queue_name = test_tasks.noop_task.using(
+            queue_name="unknown_queue"
+        )
+
+        with override_settings(
+            TASKS={
+                "default": {
+                    "BACKEND": "django_tasks.backends.dummy.DummyBackend",
+                    "QUEUES": ["queue-1"],
+                    "ENQUEUE_ON_COMMIT": False,
+                }
+            }
+        ):
+            with self.assertRaisesMessage(
+                InvalidTaskError, "Queue 'unknown_queue' is not valid for backend"
+            ):
+                await task_with_custom_queue_name.aenqueue()
 
 
 class DummyBackendTransactionTestCase(TransactionTestCase):
@@ -250,3 +350,17 @@ class DummyBackendTransactionTestCase(TransactionTestCase):
         self.assertIsNone(result.enqueued_at)
         result.refresh()
         self.assertIsNotNone(result.enqueued_at)
+
+    @override_settings(
+        TASKS={
+            "default": {
+                "BACKEND": "django_tasks.backends.dummy.DummyBackend",
+                "ENQUEUE_ON_COMMIT": True,
+            }
+        }
+    )
+    @skipIfDBFeature("supports_transactions")
+    def test_enqueue_on_commit_with_no_transactions(self) -> None:
+        self.assertIn(
+            "tasks.E002", {error.id for error in default_task_backend.check()}
+        )

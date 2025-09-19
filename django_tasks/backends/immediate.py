@@ -1,17 +1,19 @@
 import logging
 from functools import partial
-from inspect import iscoroutinefunction
 from typing import TypeVar
-from uuid import uuid4
 
-from asgiref.sync import async_to_sync
 from django.db import transaction
 from django.utils import timezone
 from typing_extensions import ParamSpec
 
-from django_tasks.signals import task_enqueued, task_finished
-from django_tasks.task import ResultStatus, Task, TaskResult
-from django_tasks.utils import exception_to_dict, json_normalize
+from django_tasks.base import ResultStatus, Task, TaskContext, TaskError, TaskResult
+from django_tasks.signals import task_enqueued, task_finished, task_started
+from django_tasks.utils import (
+    get_exception_traceback,
+    get_module_path,
+    get_random_id,
+    json_normalize,
+)
 
 from .base import BaseTaskBackend
 
@@ -24,64 +26,88 @@ P = ParamSpec("P")
 
 class ImmediateBackend(BaseTaskBackend):
     supports_async_task = True
+    supports_priority = True
+
+    def __init__(self, alias: str, params: dict):
+        super().__init__(alias, params)
+
+        self.worker_id = get_random_id()
 
     def _execute_task(self, task_result: TaskResult) -> None:
         """
-        Execute the task for the given `TaskResult`, mutating it with the outcome
+        Execute the Task for the given TaskResult, mutating it with the outcome
         """
         object.__setattr__(task_result, "enqueued_at", timezone.now())
         task_enqueued.send(type(self), task_result=task_result)
 
         task = task_result.task
 
-        calling_task_func = (
-            async_to_sync(task.func) if iscoroutinefunction(task.func) else task.func
-        )
+        task_start_time = timezone.now()
 
-        object.__setattr__(task_result, "started_at", timezone.now())
+        object.__setattr__(task_result, "status", ResultStatus.RUNNING)
+        object.__setattr__(task_result, "started_at", task_start_time)
+        object.__setattr__(task_result, "last_attempted_at", task_start_time)
+        task_result.worker_ids.append(self.worker_id)
+        task_started.send(sender=type(self), task_result=task_result)
+
         try:
+            if task.takes_context:
+                raw_return_value = task.call(
+                    TaskContext(task_result=task_result),
+                    *task_result.args,
+                    **task_result.kwargs,
+                )
+            else:
+                raw_return_value = task.call(*task_result.args, **task_result.kwargs)
+
             object.__setattr__(
                 task_result,
                 "_return_value",
-                json_normalize(
-                    calling_task_func(*task_result.args, **task_result.kwargs)
-                ),
+                json_normalize(raw_return_value),
             )
-        except BaseException as e:
+        except KeyboardInterrupt:
             # If the user tried to terminate, let them
-            if isinstance(e, KeyboardInterrupt):
-                raise
-
+            raise
+        except BaseException as e:
             object.__setattr__(task_result, "finished_at", timezone.now())
-            try:
-                object.__setattr__(task_result, "_exception_data", exception_to_dict(e))
-            except Exception:
-                logger.exception("Task id=%s unable to save exception", task_result.id)
+
+            task_result.errors.append(
+                TaskError(
+                    exception_class_path=get_module_path(type(e)),
+                    traceback=get_exception_traceback(e),
+                )
+            )
 
             object.__setattr__(task_result, "status", ResultStatus.FAILED)
 
             task_finished.send(type(self), task_result=task_result)
         else:
             object.__setattr__(task_result, "finished_at", timezone.now())
-            object.__setattr__(task_result, "status", ResultStatus.COMPLETE)
+            object.__setattr__(task_result, "status", ResultStatus.SUCCEEDED)
 
             task_finished.send(type(self), task_result=task_result)
 
     def enqueue(
-        self, task: Task[P, T], args: P.args, kwargs: P.kwargs
+        self,
+        task: Task[P, T],
+        args: P.args,  # type:ignore[valid-type]
+        kwargs: P.kwargs,  # type:ignore[valid-type]
     ) -> TaskResult[T]:
         self.validate_task(task)
 
         task_result = TaskResult[T](
             task=task,
-            id=str(uuid4()),
-            status=ResultStatus.NEW,
+            id=get_random_id(),
+            status=ResultStatus.READY,
             enqueued_at=None,
             started_at=None,
+            last_attempted_at=None,
             finished_at=None,
-            args=json_normalize(args),
-            kwargs=json_normalize(kwargs),
+            args=args,
+            kwargs=kwargs,
             backend=self.alias,
+            errors=[],
+            worker_ids=[],
         )
 
         if self._get_enqueue_on_commit_for_task(task) is not False:

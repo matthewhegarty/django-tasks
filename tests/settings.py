@@ -2,11 +2,10 @@ import os
 import sys
 
 import dj_database_url
-import django
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-IN_TEST = sys.argv[1] == "test"
+IN_TEST = "IN_TEST" in os.environ or (len(sys.argv) > 1 and sys.argv[1] == "test")
 
 ALLOWED_HOSTS = ["*"]
 
@@ -59,10 +58,6 @@ DATABASES = {
         default="sqlite:///" + os.path.join(BASE_DIR, "db.sqlite3")
     )
 }
-
-# Set exclusive transactions in 5.1+
-if django.VERSION >= (5, 1) and "sqlite" in DATABASES["default"]["ENGINE"]:
-    DATABASES["default"].setdefault("OPTIONS", {})["transaction_mode"] = "EXCLUSIVE"
 
 if "sqlite" in DATABASES["default"]["ENGINE"]:
     DATABASES["default"]["TEST"] = {"NAME": os.path.join(BASE_DIR, "db-test.sqlite3")}

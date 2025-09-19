@@ -1,5 +1,5 @@
 import dataclasses
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
@@ -8,19 +8,19 @@ from django.utils.module_loading import import_string
 from django_tasks import (
     DEFAULT_QUEUE_NAME,
     ResultStatus,
-    Task,
     default_task_backend,
     task,
     tasks,
 )
 from django_tasks.backends.dummy import DummyBackend
 from django_tasks.backends.immediate import ImmediateBackend
+from django_tasks.base import MAX_PRIORITY, MIN_PRIORITY, Task
 from django_tasks.exceptions import (
     InvalidTaskBackendError,
     InvalidTaskError,
     ResultDoesNotExist,
+    TaskIntegrityError,
 )
-from django_tasks.task import MAX_PRIORITY, MIN_PRIORITY
 from tests import tasks as test_tasks
 
 
@@ -31,7 +31,11 @@ from tests import tasks as test_tasks
             "QUEUES": ["default", "queue_1"],
             "ENQUEUE_ON_COMMIT": False,
         },
-        "immediate": {"BACKEND": "django_tasks.backends.immediate.ImmediateBackend"},
+        "immediate": {
+            "BACKEND": "django_tasks.backends.immediate.ImmediateBackend",
+            "ENQUEUE_ON_COMMIT": False,
+            "QUEUES": [],
+        },
         "missing": {"BACKEND": "does.not.exist"},
     }
 )
@@ -51,7 +55,7 @@ class TaskTestCase(SimpleTestCase):
     def test_enqueue_task(self) -> None:
         result = test_tasks.noop_task.enqueue()
 
-        self.assertEqual(result.status, ResultStatus.NEW)
+        self.assertEqual(result.status, ResultStatus.READY)
         self.assertEqual(result.task, test_tasks.noop_task)
         self.assertEqual(result.args, [])
         self.assertEqual(result.kwargs, {})
@@ -61,12 +65,24 @@ class TaskTestCase(SimpleTestCase):
     async def test_enqueue_task_async(self) -> None:
         result = await test_tasks.noop_task.aenqueue()
 
-        self.assertEqual(result.status, ResultStatus.NEW)
+        self.assertEqual(result.status, ResultStatus.READY)
         self.assertEqual(result.task, test_tasks.noop_task)
         self.assertEqual(result.args, [])
         self.assertEqual(result.kwargs, {})
 
         self.assertEqual(default_task_backend.results, [result])  # type:ignore[attr-defined]
+
+    def test_enqueue_with_invalid_argument(self) -> None:
+        with self.assertRaisesMessage(
+            TypeError, "Object of type datetime is not JSON serializable"
+        ):
+            test_tasks.noop_task.enqueue(datetime.now())
+
+    async def test_aenqueue_with_invalid_argument(self) -> None:
+        with self.assertRaisesMessage(
+            TypeError, "Object of type datetime is not JSON serializable"
+        ):
+            await test_tasks.noop_task.aenqueue(datetime.now())
 
     def test_using_priority(self) -> None:
         self.assertEqual(test_tasks.noop_task.priority, 0)
@@ -85,10 +101,6 @@ class TaskTestCase(SimpleTestCase):
 
         self.assertIsNone(test_tasks.noop_task.run_after)
         self.assertEqual(test_tasks.noop_task.using(run_after=now).run_after, now)
-        self.assertIsInstance(
-            test_tasks.noop_task.using(run_after=timedelta(hours=1)).run_after,
-            datetime,
-        )
         self.assertIsNone(test_tasks.noop_task.run_after)
 
     def test_using_unknown_backend(self) -> None:
@@ -168,6 +180,19 @@ class TaskTestCase(SimpleTestCase):
         test_tasks.noop_task.using(priority=-100)
         test_tasks.noop_task.using(priority=0)
 
+    def test_unknown_queue_name(self) -> None:
+        with self.assertRaisesMessage(
+            InvalidTaskError, "Queue 'queue-2' is not valid for backend"
+        ):
+            test_tasks.noop_task.using(queue_name="queue-2")
+        # Validation is bypassed when the backend QUEUES is an empty list.
+        self.assertEqual(
+            test_tasks.noop_task.using(
+                queue_name="queue-2", backend="immediate"
+            ).queue_name,
+            "queue-2",
+        )
+
     def test_call_task(self) -> None:
         self.assertEqual(test_tasks.calculate_meaning_of_life.call(), 42)
 
@@ -203,12 +228,12 @@ class TaskTestCase(SimpleTestCase):
 
     def test_get_incorrect_result(self) -> None:
         result = default_task_backend.enqueue(test_tasks.noop_task_async, (), {})
-        with self.assertRaises(ResultDoesNotExist):
+        with self.assertRaisesMessage(TaskIntegrityError, "Task does not match"):
             test_tasks.noop_task.get_result(result.id)
 
     async def test_get_incorrect_result_async(self) -> None:
         result = await default_task_backend.aenqueue(test_tasks.noop_task_async, (), {})
-        with self.assertRaises(ResultDoesNotExist):
+        with self.assertRaisesMessage(TaskIntegrityError, "Task does not match"):
             await test_tasks.noop_task.aget_result(result.id)
 
     def test_invalid_function(self) -> None:
@@ -245,3 +270,47 @@ class TaskTestCase(SimpleTestCase):
             import_string(test_tasks.noop_task_async.module_path),
             test_tasks.noop_task_async,
         )
+
+    @override_settings(TASKS={})
+    def test_no_backends(self) -> None:
+        with self.assertRaises(InvalidTaskBackendError):
+            test_tasks.noop_task.enqueue()
+
+    def test_task_error_invalid_exception(self) -> None:
+        with self.assertLogs("django_tasks"):
+            immediate_task = test_tasks.failing_task_value_error.using(
+                backend="immediate"
+            ).enqueue()
+
+        self.assertEqual(len(immediate_task.errors), 1)
+
+        object.__setattr__(
+            immediate_task.errors[0], "exception_class_path", "subprocess.run"
+        )
+
+        with self.assertRaisesMessage(
+            ValueError, "'subprocess.run' does not reference a valid exception."
+        ):
+            immediate_task.errors[0].exception_class  # noqa: B018
+
+    def test_task_error_unknown_module(self) -> None:
+        with self.assertLogs("django_tasks"):
+            immediate_task = test_tasks.failing_task_value_error.using(
+                backend="immediate"
+            ).enqueue()
+
+        self.assertEqual(len(immediate_task.errors), 1)
+
+        object.__setattr__(
+            immediate_task.errors[0], "exception_class_path", "does.not.exist"
+        )
+
+        with self.assertRaises(ImportError):
+            immediate_task.errors[0].exception_class  # noqa: B018
+
+    def test_takes_context_without_taking_context(self) -> None:
+        with self.assertRaisesMessage(
+            InvalidTaskError,
+            "Task takes context but does not have a first argument of 'context'",
+        ):
+            task(takes_context=True)(test_tasks.calculate_meaning_of_life.func)  # type: ignore[arg-type]

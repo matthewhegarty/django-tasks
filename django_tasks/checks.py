@@ -1,14 +1,16 @@
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from django.apps.config import AppConfig
-from django.core.checks.messages import CheckMessage
+from django.core import checks
 
 from django_tasks import tasks
 
 
+@checks.register
 def check_tasks(
     app_configs: Sequence[AppConfig] = None, **kwargs: Any
-) -> Iterable[CheckMessage]:
+) -> Iterable[checks.CheckMessage]:
     """Checks all registered task backends."""
 
     for backend in tasks.all():

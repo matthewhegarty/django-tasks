@@ -42,6 +42,7 @@ A few backends are included by default:
 - `django_tasks.backends.dummy.DummyBackend`: Don't execute the tasks, just store them. This is especially useful for testing.
 - `django_tasks.backends.immediate.ImmediateBackend`: Execute the task immediately in the current thread
 - `django_tasks.backends.database.DatabaseBackend`: Store tasks in the database (via Django's ORM), and retrieve and execute them using the `db_worker` management command
+- `django_tasks.backends.rq.RQBackend`: A backend which enqueues tasks using [RQ](https://python-rq.org/) via [`django-rq`](https://github.com/rq/django-rq) (requires installing `django-tasks[rq]`).
 
 Note: `DatabaseBackend` additionally requires `django_tasks.backends.database` adding to `INSTALLED_APPS`.
 
@@ -75,7 +76,27 @@ These attributes (besides `enqueue_on_commit`) can also be modified at run-time 
 modified_task = calculate_meaning_of_life.using(priority=10)
 ```
 
-In addition to the above attributes, `run_after` can be passed to specify a specific time the task should run. Both a timezone-aware `datetime` or `timedelta` may be passed.
+In addition to the above attributes, `run_after` can be passed to specify a specific time the task should run.
+
+#### Task context
+
+Sometimes the running task may need to know context about how it was enqueued. To receive the task context as an argument to your task function, pass `takes_context` to the decorator and ensure the task takes a `context` as the first argument.
+
+```python
+from django_tasks import task, TaskContext
+
+
+@task(takes_context=True)
+def calculate_meaning_of_life(context: TaskContext) -> int:
+    return 42
+```
+
+The task context has the following attributes:
+
+- `task_result`: The running task result
+- `attempt`: The current attempt number for the task
+
+This API will be extended with additional features in future.
 
 ### Enqueueing tasks
 
@@ -157,9 +178,11 @@ Finally, you can run the `db_worker` command to run tasks as they're created. Ch
 ./manage.py db_worker
 ```
 
+In `DEBUG`, the worker will automatically reload when code is changed (or by using `--reload`). This is not recommended in production environments as tasks may not be stopped cleanly.
+
 ### Pruning old tasks
 
-After a while, tasks may start to build up in your database. This can be managed using the `prune_db_task_results` management command, which deletes completed and failed tasks according to the given retention policy. Check the `--help` for the available options.
+After a while, tasks may start to build up in your database. This can be managed using the `prune_db_task_results` management command, which deletes completed tasks according to the given retention policy. Check the `--help` for the available options.
 
 ### Retrieving task result
 
@@ -172,6 +195,8 @@ result_id = result.id
 calculate_meaning_of_life.get_result(result_id)
 ```
 
+A result `id` should be considered an opaque string, whose length could be up to 64 characters. ID generation is backend-specific.
+
 Only tasks of the same type can be retrieved this way. To retrieve the result of any task, you can call `get_result` on the backend:
 
 ```python
@@ -182,38 +207,42 @@ default_task_backend.get_result(result_id)
 
 ### Return values
 
-If your task returns something, it can be retrieved from the `.return_value` attribute on a `TaskResult`. Accessing this property on an unfinished task (ie not `COMPLETE` or `FAILED`) will raise a `ValueError`.
+If your task returns something, it can be retrieved from the `.return_value` attribute on a `TaskResult`. Accessing this property on an unsuccessful task (ie not `SUCCEEDED`) will raise a `ValueError`.
 
 ```python
-assert result.status == ResultStatus.COMPLETE
+assert result.status == ResultStatus.SUCCEEDED
 assert result.return_value == 42
 ```
 
 If a result has been updated in the background, you can call `refresh` on it to update its values. Results obtained using `get_result` will always be up-to-date.
 
 ```python
-assert result.status == ResultStatus.NEW
+assert result.status == ResultStatus.READY
 result.refresh()
-assert result.status == ResultStatus.COMPLETE
+assert result.status == ResultStatus.SUCCEEDED
 ```
 
-#### Exceptions
+#### Errors
 
-If a task raised an exception, its `.exception` will be the exception raised:
+If a task raised an exception, its `.errors` contains information about the error:
 
 ```python
-assert isinstance(result.exception, ValueError)
+assert result.errors[0].exception_class == ValueError
 ```
 
-As part of the serialization process for exceptions, some information is lost. The traceback information is reduced to a string that you can print to help debugging:
+Note that this is just the type of exception, and contains no other values. The traceback information is reduced to a string that you can print to help debugging:
 
 ```python
-assert isinstance(result.traceback, str)
+assert isinstance(result.errors[0].traceback, str)
 ```
 
-The stack frames, `globals()` and `locals()` are not available.
+Note that currently, whilst `.errors` is a list, it will only ever contain a single element.
 
-If the exception could not be serialized, the `.result` is `None`.
+#### Attempts
+
+The number of times a task has been run is stored as the `.attempts` attribute. This will currently only ever be 0 or 1.
+
+The date of the last attempt is stored as `.last_attempted_at`.
 
 ### Backend introspecting
 
@@ -222,6 +251,7 @@ Because `django-tasks` enables support for multiple different backends, those ba
 - `supports_defer`: Can tasks be enqueued with the `run_after` attribute?
 - `supports_async_task`: Can coroutines be enqueued?
 - `supports_get_result`: Can results be retrieved after the fact (from **any** thread / process)?
+- `supports_priority`: Can tasks be executed in a given priority order?
 
 ```python
 from django_tasks import default_task_backend
@@ -238,7 +268,39 @@ A few [Signals](https://docs.djangoproject.com/en/stable/topics/signals/) are pr
 Whilst signals are available, they may not be the most maintainable approach.
 
 - `django_tasks.signals.task_enqueued`: Called when a task is enqueued. The sender is the backend class. Also called with the enqueued `task_result`.
-- `django_tasks.signals.task_finished`: Called when a task finishes (`COMPLETE` or `FAILED`). The sender is the backend class. Also called with the finished `task_result`.
+- `django_tasks.signals.task_finished`: Called when a task finishes (`SUCCEEDED` or `FAILED`). The sender is the backend class. Also called with the finished `task_result`.
+- `django_tasks.signals.task_started`: Called immediately before a task starts executing. The sender is the backend class. Also called with the started `task_result`.
+
+## RQ
+
+The RQ-based backend acts as an interface between `django_tasks` and `RQ`, allowing tasks to be defined and enqueued using `django_tasks`, but stored in Redis and executed using RQ's workers.
+
+Once RQ is configured as necessary, the relevant `django_tasks` configuration can be added:
+
+```python
+TASKS = {
+    "default": {
+        "BACKEND": "django_tasks.backends.rq.RQBackend",
+        "QUEUES": ["default"]
+    }
+}
+```
+
+Any queues defined in `QUEUES` must also be defined in `django-rq`'s `RQ_QUEUES` setting.
+
+### Job class
+
+To use `rq` with `django-tasks`, a custom `Job` class must be used. This can be passed to the worker using `--job-class`:
+
+```shell
+./manage.py rqworker --job-class django_tasks.backend.rq.Job
+```
+
+### Priorities
+
+`rq` has no native concept of priorities - instead relying on workers to define which queues they should pop tasks from in order. Therefore, `task.priority` has little effect on execution priority.
+
+If a task has a priority of `100`, it is enqueued at the top of the queue, and will be the next task executed by a worker. All other priorities will enqueue the task to the back of the queue. The queue value is not stored, and will always be `0`.
 
 ## Contributing
 

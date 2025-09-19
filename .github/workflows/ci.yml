@@ -15,20 +15,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
-        django-version: ["4.2", "5.0", "5.1"]
-        exclude:
-          - django-version: "5.0"
-            python-version: "3.8"
-          - django-version: "5.0"
-            python-version: "3.9"
-          - django-version: "5.1"
-            python-version: "3.8"
-          - django-version: "5.1"
-            python-version: "3.9"
-          - os: windows-latest  # JSON1 is only built-in on 3.9+
-            python-version: 3.8
-
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        django-version: ["4.2", "5.0", "5.1", "5.2"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
@@ -47,10 +35,12 @@ jobs:
           pip install Django~=${{ matrix.django-version }}
       - name: Lint
         run: just lint
-      - name: Run tests
-        run: just test
       - name: Run fast tests
-        run: just test-fast
+        if: ${{ !cancelled() }}
+        run: just test-fast -v2
+      - name: Run tests
+        if: ${{ !cancelled() }}
+        run: just test -v2 --keepdb
 
   test-postgres:
     runs-on: ubuntu-latest
@@ -66,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        django-version: ["4.2", "5.0", "5.1"]
+        django-version: ["4.2", "5.0", "5.1", "5.2"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python 3.13
@@ -84,7 +74,7 @@ jobs:
           pip install -e '.[dev,postgres]'
           pip install Django~=${{ matrix.django-version }}
       - name: Run tests
-        run: just test
+        run: just test -v2
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost/postgres
 
@@ -101,7 +91,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        django-version: ["4.2", "5.0", "5.1"]
+        django-version: ["4.2", "5.0", "5.1", "5.2"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python 3.13
@@ -119,7 +109,7 @@ jobs:
           pip install -e '.[dev,mysql]'
           pip install Django~=${{ matrix.django-version }}
       - name: Run tests
-        run: just test
+        run: just test -v2
         env:
           DATABASE_URL: mysql://root:django@127.0.0.1/django
 

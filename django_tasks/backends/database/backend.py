@@ -1,19 +1,19 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
-import django
 from django.apps import apps
-from django.core.checks import messages
+from django.core import checks
 from django.core.exceptions import ValidationError
-from django.db import connections, router, transaction
+from django.db import transaction
+from django.utils.version import PY311
 from typing_extensions import ParamSpec
 
 from django_tasks.backends.base import BaseTaskBackend
+from django_tasks.base import Task
+from django_tasks.base import TaskResult as BaseTaskResult
 from django_tasks.exceptions import ResultDoesNotExist
 from django_tasks.signals import task_enqueued
-from django_tasks.task import Task
-from django_tasks.task import TaskResult as BaseTaskResult
-from django_tasks.utils import json_normalize
 
 if TYPE_CHECKING:
     from .models import DBTaskResult
@@ -22,7 +22,7 @@ T = TypeVar("T")
 P = ParamSpec("P")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=PY311, kw_only=True)  # type: ignore[literal-required]
 class TaskResult(BaseTaskResult[T]):
     db_result: "DBTaskResult"
 
@@ -31,23 +31,30 @@ class DatabaseBackend(BaseTaskBackend):
     supports_async_task = True
     supports_get_result = True
     supports_defer = True
+    supports_priority = True
 
     def _task_to_db_task(
-        self, task: Task[P, T], args: P.args, kwargs: P.kwargs
+        self,
+        task: Task[P, T],
+        args: P.args,  # type:ignore[valid-type]
+        kwargs: P.kwargs,  # type:ignore[valid-type]
     ) -> "DBTaskResult":
         from .models import DBTaskResult
 
         return DBTaskResult(
-            args_kwargs=json_normalize({"args": args, "kwargs": kwargs}),
+            args_kwargs={"args": args, "kwargs": kwargs},
             priority=task.priority,
             task_path=task.module_path,
             queue_name=task.queue_name,
-            run_after=task.run_after,
+            run_after=task.run_after,  # type: ignore[misc]
             backend_name=self.alias,
         )
 
     def enqueue(
-        self, task: Task[P, T], args: P.args, kwargs: P.kwargs
+        self,
+        task: Task[P, T],
+        args: P.args,  # type:ignore[valid-type]
+        kwargs: P.kwargs,  # type:ignore[valid-type]
     ) -> TaskResult[T]:
         self.validate_task(task)
 
@@ -80,31 +87,13 @@ class DatabaseBackend(BaseTaskBackend):
         except (DBTaskResult.DoesNotExist, ValidationError) as e:
             raise ResultDoesNotExist(result_id) from e
 
-    def check(self, **kwargs: Any) -> Iterable[messages.CheckMessage]:
-        from .models import DBTaskResult
-        from .utils import connection_requires_manual_exclusive_transaction
-
+    def check(self, **kwargs: Any) -> Iterable[checks.CheckMessage]:
         yield from super().check(**kwargs)
 
         backend_name = self.__class__.__name__
 
         if not apps.is_installed("django_tasks.backends.database"):
-            yield messages.CheckMessage(
-                messages.ERROR,
+            yield checks.Error(
                 f"{backend_name} configured as django_tasks backend, but database app not installed",
                 "Insert 'django_tasks.backends.database' in INSTALLED_APPS",
-            )
-
-        db_connection = connections[router.db_for_read(DBTaskResult)]
-        # Manually called to set `transaction_mode`
-        db_connection.get_connection_params()
-        if (
-            # Versions below 5.1 can't be configured, so always assume exclusive transactions
-            django.VERSION >= (5, 1)
-            and connection_requires_manual_exclusive_transaction(db_connection)
-        ):
-            yield messages.CheckMessage(
-                messages.ERROR,
-                f"{backend_name} is using SQLite non-exclusive transactions",
-                f"Set settings.DATABASES[{db_connection.alias!r}]['OPTIONS']['transaction_mode'] to 'EXCLUSIVE'",
             )

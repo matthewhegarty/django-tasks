@@ -3,7 +3,7 @@ from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 
 class InvalidTaskError(Exception):
     """
-    The provided task is invalid.
+    The provided Task is invalid.
     """
 
 
@@ -12,4 +12,8 @@ class InvalidTaskBackendError(ImproperlyConfigured):
 
 
 class ResultDoesNotExist(ObjectDoesNotExist):
+    pass
+
+
+class TaskIntegrityError(ObjectDoesNotExist):
     pass

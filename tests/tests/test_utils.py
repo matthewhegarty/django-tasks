@@ -1,19 +1,22 @@
 import datetime
-import hashlib
-import optparse
 import subprocess
-from typing import List
 from unittest.mock import Mock
 
-from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 
 from django_tasks import utils
-from django_tasks.exceptions import InvalidTaskError
 from tests import tasks as test_tasks
 
 
 class IsModuleLevelFunctionTestCase(SimpleTestCase):
+    @classmethod
+    def _class_method(cls) -> None:
+        return None
+
+    @staticmethod
+    def _static_method() -> None:
+        return None
+
     def test_builtin(self) -> None:
         self.assertFalse(utils.is_module_level_function(any))
         self.assertFalse(utils.is_module_level_function(isinstance))
@@ -36,20 +39,18 @@ class IsModuleLevelFunctionTestCase(SimpleTestCase):
         self.assertFalse(utils.is_module_level_function(self.test_method))
         self.assertFalse(utils.is_module_level_function(self.setUp))
 
+    def test_unbound_method(self) -> None:
+        self.assertTrue(
+            utils.is_module_level_function(self.__class__.test_unbound_method)
+        )
+        self.assertTrue(utils.is_module_level_function(self.__class__.setUp))
+
     def test_lambda(self) -> None:
         self.assertFalse(utils.is_module_level_function(lambda: True))
 
-    def test_uninitialised_method(self) -> None:
-        # This import has to be here, so the module is loaded during the test
-        from . import is_module_level_function_fixture
-
-        self.assertTrue(is_module_level_function_fixture.really_module_level_function)
-        self.assertIsNotNone(
-            is_module_level_function_fixture.inner_func_is_module_level_function
-        )
-        self.assertFalse(
-            is_module_level_function_fixture.inner_func_is_module_level_function
-        )
+    def test_class_and_static_method(self) -> None:
+        self.assertTrue(utils.is_module_level_function(self._static_method))
+        self.assertFalse(utils.is_module_level_function(self._class_method))
 
 
 class JSONNormalizeTestCase(SimpleTestCase):
@@ -78,88 +79,46 @@ class RetryTestCase(SimpleTestCase):
         self.assertTrue(utils.retry()(lambda: True)())
         self.assertFalse(utils.retry()(lambda: False)())
 
+    def test_skip_retry_on_keyboard_interrupt(self) -> None:
+        sentinel = Mock(side_effect=KeyboardInterrupt(""))
 
-class ExceptionSerializationTestCase(SimpleTestCase):
-    def test_serialize_exceptions(self) -> None:
-        for exc in [
-            ValueError(10),
-            SyntaxError("Wrong"),
-            ImproperlyConfigured("It's wrong"),
-            InvalidTaskError(""),
-            SystemExit(),
-        ]:
-            with self.subTest(exc):
-                data = utils.exception_to_dict(exc)
-                self.assertEqual(utils.json_normalize(data), data)
-                self.assertEqual(
-                    set(data.keys()), {"exc_type", "exc_args", "exc_traceback"}
-                )
-                exception = utils.exception_from_dict(data)
-                self.assertIsInstance(exception, type(exc))
-                self.assertEqual(exception.args, exc.args)
+        with self.assertRaises(KeyboardInterrupt):
+            utils.retry()(sentinel)()
 
-                # Check that the exception traceback contains a minimal traceback
-                msg = str(exc.args[0]) if exc.args else ""
-                traceback = data["exc_traceback"]
-                self.assertIn(exc.__class__.__name__, traceback)
-                self.assertIn(msg, traceback)
+        self.assertEqual(sentinel.call_count, 1)
 
-    def test_serialize_full_traceback(self) -> None:
+
+class RandomIdTestCase(SimpleTestCase):
+    def test_correct_length(self) -> None:
+        self.assertEqual(len(utils.get_random_id()), 32)
+
+    def test_random_ish(self) -> None:
+        random_ids = [utils.get_random_id() for _ in range(1000)]
+
+        self.assertEqual(len(random_ids), len(set(random_ids)))
+
+
+class ExceptionTracebackTestCase(SimpleTestCase):
+    def test_literal_exception(self) -> None:
+        self.assertEqual(
+            utils.get_exception_traceback(ValueError("Failure")),
+            "ValueError: Failure\n",
+        )
+
+    def test_exception(self) -> None:
         try:
-            # Using optparse to generate an error because:
-            # - it's pure python
-            # - it's easy to trip down
-            # - it's unlikely to change ever
-            optparse.OptionParser(option_list=[1])  # type: ignore
-        except Exception as e:
-            traceback = utils.exception_to_dict(e)["exc_traceback"]
-            # The test is willingly fuzzy to ward against changes in the
-            # traceback formatting
-            self.assertIn("traceback", traceback.lower())
-            self.assertIn("line", traceback.lower())
-            self.assertIn(optparse.__file__, traceback)
-            self.assertTrue(
-                traceback.endswith("TypeError: not an Option instance: 1\n")
-            )
+            1 / 0  # noqa:B018
+        except ZeroDivisionError as e:
+            traceback = utils.get_exception_traceback(e)
+            self.assertIn("ZeroDivisionError: division by zero", traceback)
+        else:
+            self.fail("ZeroDivisionError not raised")
 
-    def test_serialize_traceback_from_c_module(self) -> None:
+    def test_complex_exception(self) -> None:
         try:
-            # Same as test_serialize_full_traceback, but uses hashlib
-            # because it's in C, not in Python
-            hashlib.md5(1)  # type: ignore
-        except Exception as e:
-            traceback = utils.exception_to_dict(e)["exc_traceback"]
-            self.assertIn("traceback", traceback.lower())
-            self.assertTrue(
-                traceback.endswith(
-                    "TypeError: object supporting the buffer API required\n"
-                )
-            )
-            self.assertIn("hashlib.md5(1)", traceback)
-
-    def test_cannot_deserialize_non_exception(self) -> None:
-        serialized_exceptions: List[utils.SerializedExceptionDict] = [
-            {
-                "exc_type": "subprocess.check_output",
-                "exc_args": ["exit", "1"],
-                "exc_traceback": "",
-            },
-            {"exc_type": "True", "exc_args": [], "exc_traceback": ""},
-            {"exc_type": "math.pi", "exc_args": [], "exc_traceback": ""},
-            {"exc_type": __name__, "exc_args": [], "exc_traceback": ""},
-            {
-                "exc_type": utils.get_module_path(type(self)),
-                "exc_args": [],
-                "exc_traceback": "",
-            },
-            {
-                "exc_type": utils.get_module_path(Mock),
-                "exc_args": [],
-                "exc_traceback": "",
-            },
-        ]
-
-        for data in serialized_exceptions:
-            with self.subTest(data):
-                with self.assertRaises((TypeError, ImportError)):
-                    utils.exception_from_dict(data)
+            {}[datetime.datetime.now()]  # type: ignore
+        except KeyError as e:
+            traceback = utils.get_exception_traceback(e)
+            self.assertIn("KeyError: datetime.datetime", traceback)
+        else:
+            self.fail("KeyError not raised")
